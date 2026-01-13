@@ -1,0 +1,5 @@
+"sample","sample_label","genotype","injury","condition"
+"19072-23-01-01-01","C8","KO","Injured","MG53 KO Injured"
+"19072-23-02-01-01","C9","WT","Injured","MG53 WT Injured"
+"19072-23-03-01-01","C10","KO","Uninjured","MG53 KO Uninjured"
+"19072-23-04-01-01","C11","WT","Uninjured","MG53 WT Uninjured"

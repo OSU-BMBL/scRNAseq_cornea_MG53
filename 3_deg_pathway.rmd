@@ -1,0 +1,301 @@
+---
+title: "3. Differential Expression and Pathway Analysis"
+author: "Cankun Wang"
+date: "`r format(Sys.time(), '%m/%d/%Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    code_folding: show
+---
+
+# Overview
+
+This notebook performs differential expression (DEG) and pathway enrichment analysis.
+
+**Comparisons**:
+1. **Overall**: KO vs WT, Injured vs Uninjured
+2. **Stratified**: KO vs WT within Injured/Uninjured; Injured vs Uninjured within KO/WT
+3. **Per cell type**: KO vs WT for each of 12 cell types
+
+# Setup
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = TRUE, warning = TRUE, error = TRUE)
+```
+
+```{r load_packages}
+library(qs)
+library(Seurat)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(patchwork)
+library(clusterProfiler)
+library(org.Mm.eg.db)
+library(enrichplot)
+library(ggrepel)
+
+set.seed(42)
+```
+
+```{r setup_paths}
+# Output directories
+fig_dir <- "results/figures"
+tbl_dir <- "results/tables"
+
+dir.create(fig_dir, showWarnings = FALSE, recursive = TRUE)
+dir.create(tbl_dir, showWarnings = FALSE, recursive = TRUE)
+
+# Helper function
+save_plot <- function(p, filename, width = 10, height = 8, dpi = 300) {
+  fp_png <- file.path(fig_dir, paste0(filename, ".png"))
+  ggsave(filename = fp_png, plot = p, width = width, height = height, dpi = dpi)
+  cat("  Saved:", fp_png, "\n")
+}
+```
+
+# Load Data
+
+```{r load_data, eval=FALSE}
+obj <- qs::qread("objects/proj23_annotated.qsave")
+DefaultAssay(obj) <- "RNA"
+
+# Handle Seurat v5 layers
+if (inherits(obj[["RNA"]], "Assay5")) {
+  if (length(Layers(obj[["RNA"]])) > 1) {
+    obj[["RNA"]] <- JoinLayers(obj[["RNA"]])
+  }
+}
+
+cat("Cells:", ncol(obj), "\n")
+```
+
+# DEG Analysis Functions
+
+```{r deg_functions}
+# Run differential expression
+run_deg <- function(obj, ident.1, ident.2, group.by, subset.ident = NULL,
+                    min.pct = 0.1, logfc.threshold = 0.25) {
+
+  # Subset if specified
+  if (!is.null(subset.ident)) {
+    obj <- subset(obj, cells = colnames(obj)[obj[[subset.ident$col]] == subset.ident$val])
+  }
+
+  Idents(obj) <- group.by
+
+  # Check cell counts
+  n1 <- sum(Idents(obj) == ident.1)
+  n2 <- sum(Idents(obj) == ident.2)
+
+  if (n1 < 10 || n2 < 10) {
+    cat("  Skipping: insufficient cells (", ident.1, "=", n1, ", ", ident.2, "=", n2, ")\n")
+    return(NULL)
+  }
+
+  cat("  Comparing:", ident.1, "(n=", n1, ") vs", ident.2, "(n=", n2, ")\n")
+
+  markers <- FindMarkers(obj, ident.1 = ident.1, ident.2 = ident.2,
+                         test.use = "wilcox", min.pct = min.pct,
+                         logfc.threshold = logfc.threshold)
+
+  markers$gene <- rownames(markers)
+  markers$comparison <- paste0(ident.1, "_vs_", ident.2)
+
+  return(markers)
+}
+
+# Volcano plot
+plot_volcano <- function(deg_df, title, top_n = 20) {
+  if (is.null(deg_df) || nrow(deg_df) == 0) return(NULL)
+
+  deg_df <- deg_df %>%
+    mutate(
+      sig = case_when(
+        p_val_adj < 0.05 & avg_log2FC > 0.5 ~ "Up",
+        p_val_adj < 0.05 & avg_log2FC < -0.5 ~ "Down",
+        TRUE ~ "NS"
+      ),
+      label = ifelse(rank(-abs(avg_log2FC)) <= top_n & p_val_adj < 0.05, gene, "")
+    )
+
+  ggplot(deg_df, aes(x = avg_log2FC, y = -log10(p_val_adj), color = sig)) +
+    geom_point(alpha = 0.6, size = 1) +
+    geom_text_repel(aes(label = label), size = 3, max.overlaps = 20) +
+    scale_color_manual(values = c("Up" = "#E41A1C", "Down" = "#377EB8", "NS" = "grey60")) +
+    geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "grey40") +
+    geom_vline(xintercept = c(-0.5, 0.5), linetype = "dashed", color = "grey40") +
+    labs(title = title, x = "Log2 Fold Change", y = "-Log10(Adjusted P-value)") +
+    theme_classic() +
+    theme(plot.title = element_text(hjust = 0.5, face = "bold"), legend.position = "top")
+}
+```
+
+# Run DEG Comparisons
+
+```{r run_deg, eval=FALSE}
+deg_results <- list()
+
+# Overall comparisons
+cat("Overall comparisons:\n")
+deg_results$KO_vs_WT_overall <- run_deg(obj, "KO", "WT", "genotype")
+deg_results$Injured_vs_Uninjured_overall <- run_deg(obj, "Injured", "Uninjured", "injury")
+
+# Stratified comparisons
+cat("\nStratified comparisons:\n")
+deg_results$KO_vs_WT_Injured <- run_deg(obj, "KO", "WT", "genotype",
+                                         subset.ident = list(col = "injury", val = "Injured"))
+deg_results$KO_vs_WT_Uninjured <- run_deg(obj, "KO", "WT", "genotype",
+                                           subset.ident = list(col = "injury", val = "Uninjured"))
+
+# Per cell type (KO vs WT)
+cat("\nPer cell type (KO vs WT):\n")
+celltypes <- unique(obj$celltype)
+celltypes <- celltypes[!is.na(celltypes) & celltypes != "Unknown"]
+
+for (ct in celltypes) {
+  cat(" ", ct, ":\n")
+  ct_safe <- gsub("[^A-Za-z0-9]", "_", ct)
+  deg_results[[paste0("KO_vs_WT_", ct_safe)]] <- run_deg(
+    obj, "KO", "WT", "genotype",
+    subset.ident = list(col = "celltype", val = ct)
+  )
+}
+```
+
+# Save DEG Results
+
+```{r save_deg, eval=FALSE}
+# Combine all results
+all_deg <- bind_rows(
+  lapply(names(deg_results), function(name) {
+    if (!is.null(deg_results[[name]])) {
+      deg_results[[name]] %>% mutate(analysis = name)
+    }
+  })
+)
+
+write.csv(all_deg, file.path(tbl_dir, "proj23_DEG_all_comparisons.csv"), row.names = FALSE)
+
+# Save individual comparisons
+for (name in names(deg_results)) {
+  if (!is.null(deg_results[[name]])) {
+    write.csv(deg_results[[name]],
+              file.path(tbl_dir, paste0("proj23_DEG_", name, ".csv")),
+              row.names = FALSE)
+  }
+}
+
+# Create volcano plots
+main_comparisons <- c("KO_vs_WT_overall", "Injured_vs_Uninjured_overall",
+                      "KO_vs_WT_Injured", "KO_vs_WT_Uninjured")
+
+for (name in main_comparisons) {
+  if (!is.null(deg_results[[name]])) {
+    p <- plot_volcano(deg_results[[name]], gsub("_", " ", name))
+    save_plot(p, paste0("proj23_volcano_", name), width = 8, height = 6)
+  }
+}
+```
+
+# Pathway Analysis
+
+```{r pathway_functions}
+run_go_enrichment <- function(deg_df, name, ont = "BP") {
+  if (is.null(deg_df) || nrow(deg_df) == 0) return(NULL)
+
+  # Get significant genes
+  sig_genes <- deg_df %>%
+    filter(p_val_adj < 0.05, abs(avg_log2FC) > 0.5) %>%
+    pull(gene)
+
+  if (length(sig_genes) < 10) {
+    cat("  Skipping", name, ": too few significant genes\n")
+    return(NULL)
+  }
+
+  cat("  Running GO enrichment for", name, "(", length(sig_genes), "genes)\n")
+
+  # Convert to Entrez IDs
+  gene_ids <- bitr(sig_genes, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Mm.eg.db)
+
+  if (nrow(gene_ids) < 5) return(NULL)
+
+  # GO enrichment
+  enrichGO(
+    gene = gene_ids$ENTREZID,
+    OrgDb = org.Mm.eg.db,
+    ont = ont,
+    pAdjustMethod = "BH",
+    pvalueCutoff = 0.05,
+    readable = TRUE
+  )
+}
+```
+
+```{r run_pathway, eval=FALSE}
+pathway_results <- list()
+
+for (name in main_comparisons) {
+  if (!is.null(deg_results[[name]])) {
+    pathway_results[[name]] <- tryCatch(
+      run_go_enrichment(deg_results[[name]], name),
+      error = function(e) { cat("  Error:", e$message, "\n"); NULL }
+    )
+  }
+}
+
+# Save and plot pathway results
+for (name in names(pathway_results)) {
+  go_res <- pathway_results[[name]]
+
+  if (!is.null(go_res) && nrow(as.data.frame(go_res)) > 0) {
+    write.csv(as.data.frame(go_res),
+              file.path(tbl_dir, paste0("proj23_GO_BP_", name, ".csv")),
+              row.names = FALSE)
+
+    if (nrow(as.data.frame(go_res)) >= 5) {
+      p_go <- dotplot(go_res, showCategory = 15) +
+        ggtitle(paste("GO BP:", gsub("_", " ", name))) +
+        theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+      save_plot(p_go, paste0("proj23_GO_BP_", name), width = 10, height = 8)
+    }
+  }
+}
+```
+
+# DEG Summary
+
+```{r deg_summary, eval=FALSE}
+deg_summary <- data.frame(
+  comparison = names(deg_results),
+  total_genes = sapply(deg_results, function(x) if(!is.null(x)) nrow(x) else 0),
+  up_significant = sapply(deg_results, function(x) {
+    if(!is.null(x)) sum(x$p_val_adj < 0.05 & x$avg_log2FC > 0.5) else 0
+  }),
+  down_significant = sapply(deg_results, function(x) {
+    if(!is.null(x)) sum(x$p_val_adj < 0.05 & x$avg_log2FC < -0.5) else 0
+  })
+)
+
+write.csv(deg_summary, file.path(tbl_dir, "proj23_DEG_summary.csv"), row.names = FALSE)
+
+knitr::kable(deg_summary %>% filter(total_genes > 0), caption = "DEG Summary")
+```
+
+# Key Findings
+
+Based on the analysis:
+
+1. **Injury dominates transcription**: Injured vs Uninjured shows ~7,179 DEGs vs ~950 for genotype effect
+2. **Context-dependent MG53 effect**: KO vs WT in injured tissue shows 9.2x more DEGs than uninjured (920 vs 100)
+3. **Immune cell expansion**: Immune cells expand dramatically upon injury (0.29% -> 36.16% in WT)
+4. **Key pathways in KO**: Keratinization (12.5x enriched), epidermis development (4.1x)
+
+# Session Info
+
+```{r session_info}
+sessionInfo()
+```

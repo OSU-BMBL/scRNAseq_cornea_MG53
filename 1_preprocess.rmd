@@ -1,0 +1,217 @@
+---
+title: "1. Preprocessing, QC, and Harmony Integration"
+author: "Cankun Wang"
+date: "`r format(Sys.time(), '%m/%d/%Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    code_folding: show
+---
+
+# Overview
+
+This notebook performs preprocessing for the cornea scRNA-seq data (Project 19072-23):
+
+- **Data**: 4 samples (2x2 factorial: MG53 genotype x injury status)
+- **QC**: Automated filtering using `scuttle::isOutlier`
+- **Batch correction**: Harmony integration
+
+# Setup
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = TRUE, warning = TRUE, error = TRUE)
+```
+
+```{r load_packages}
+# Install packages if needed
+if (!requireNamespace("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")
+if (!require("scuttle")) BiocManager::install("scuttle")
+
+library(Seurat)
+library(scuttle)
+library(cowplot)
+library(dplyr)
+library(ggplot2)
+library(patchwork)
+library(here)
+library(qs)
+library(Polychrome)
+library(harmony)
+library(Matrix)
+
+set.seed(42)
+```
+
+# Load Data
+
+Load 10X Genomics count matrices from 4 samples.
+
+```{r load_data}
+# Define sample information
+# NOTE: Update data_dir to your local path
+# data_dir <- "path/to/your/data"
+
+sample_info <- data.frame(
+  sample = c("19072-23-01-01-01", "19072-23-02-01-01",
+             "19072-23-03-01-01", "19072-23-04-01-01"),
+  sample_label = c("C8", "C9", "C10", "C11"),
+  genotype = c("KO", "WT", "KO", "WT"),
+  injury = c("Injured", "Injured", "Uninjured", "Uninjured"),
+  condition = c("MG53 KO Injured", "MG53 WT Injured",
+                "MG53 KO Uninjured", "MG53 WT Uninjured")
+)
+
+print(sample_info)
+```
+
+```{r load_10x, eval=FALSE}
+# Load 10X data (adjust path as needed)
+data_dirs <- file.path(data_dir, sample_info$sample, "filtered_feature_bc_matrix")
+data_list <- list()
+
+for (i in seq_along(data_dirs)) {
+  current_sample <- sample_info$sample[i]
+  cat(paste("Loading sample:", current_sample, "\n"))
+
+  tmp <- Read10X(data_dirs[i], unique.features = TRUE, strip.suffix = FALSE)
+
+  data_list[[i]] <- CreateSeuratObject(
+    tmp,
+    assay = "RNA",
+    min.cells = 3,
+    min.features = 200,
+    project = current_sample
+  )
+
+  # Add QC metrics
+  # Ribosomal genes
+  rb.genes <- rownames(data_list[[i]])[grep("^Rp[sl][[:digit:]]", rownames(data_list[[i]]))]
+  if (length(rb.genes) > 0) {
+    percent.ribo <- colSums(GetAssayData(data_list[[i]], slot="counts")[rb.genes, ]) /
+      Matrix::colSums(GetAssayData(data_list[[i]], slot="counts")) * 100
+    data_list[[i]] <- AddMetaData(data_list[[i]], percent.ribo, col.name = "percent.ribo")
+  } else {
+    data_list[[i]]$percent.ribo <- 0
+  }
+
+  # Mitochondrial genes
+  data_list[[i]] <- PercentageFeatureSet(data_list[[i]], "^mt-", col.name = "percent.mito")
+
+  # Hemoglobin genes
+  data_list[[i]] <- PercentageFeatureSet(data_list[[i]], "^Hb[^(p)]", col.name = "percent.hb")
+
+  # Add sample metadata
+  data_list[[i]]@meta.data$sample <- current_sample
+}
+
+names(data_list) <- sample_info$sample
+```
+
+# Automated QC with scuttle::isOutlier
+
+Use median absolute deviation (MAD) to identify outliers for each QC metric.
+
+```{r define_qc_function}
+automated_qc_filtering <- function(seurat_obj, sample_name, nmads = 3) {
+  cat(paste("\n  Processing", sample_name, "with nmads =", nmads, "...\n"))
+
+  df <- seurat_obj@meta.data
+
+  # Identify outliers
+  outlier_libsize <- isOutlier(df$nCount_RNA, type = "both", log = TRUE, nmads = nmads)
+  outlier_features <- isOutlier(df$nFeature_RNA, type = "both", log = TRUE, nmads = nmads)
+  outlier_mito <- isOutlier(df$percent.mito, type = "higher", nmads = nmads)
+
+  # Combined outlier flag
+  outlier_combined <- outlier_libsize | outlier_features | outlier_mito
+
+  # Print thresholds
+  thresh_libsize <- attr(outlier_libsize, "thresholds")
+  thresh_features <- attr(outlier_features, "thresholds")
+  thresh_mito <- attr(outlier_mito, "thresholds")
+
+  cat("    Thresholds:\n")
+  cat("      nCount_RNA: [", round(thresh_libsize["lower"]), " - ",
+      round(thresh_libsize["higher"]), "]\n", sep = "")
+  cat("      nFeature_RNA: [", round(thresh_features["lower"]), " - ",
+      round(thresh_features["higher"]), "]\n", sep = "")
+  cat("      percent.mito: < ", round(thresh_mito["higher"], 2), "\n", sep = "")
+
+  cat("    Cells to KEEP:", sum(!outlier_combined),
+      "(", round(sum(!outlier_combined)/nrow(df)*100, 1), "%)\n")
+
+  seurat_obj$outlier_combined <- outlier_combined
+  return(seurat_obj)
+}
+```
+
+# Processing Pipeline
+
+```{r process_project, eval=FALSE}
+process_project <- function(seurat_list, sample_metadata_df, output_file,
+                            nmads = 3, run_harmony = TRUE) {
+
+  # 1. Apply automated QC
+  for (i in seq_along(seurat_list)) {
+    sample_name <- unique(seurat_list[[i]]$sample)
+    seurat_list[[i]] <- automated_qc_filtering(seurat_list[[i]], sample_name, nmads)
+  }
+
+  # 2. Filter outliers
+  for (i in seq_along(seurat_list)) {
+    seurat_list[[i]] <- subset(seurat_list[[i]], subset = outlier_combined == FALSE)
+  }
+
+  # 3. Merge samples
+  sample_names <- sapply(seurat_list, function(x) unique(x$sample))
+  combined <- merge(x = seurat_list[[1]],
+                    y = seurat_list[2:length(seurat_list)],
+                    add.cell.ids = sample_names)
+
+  # 4. Add metadata
+  combined$sample <- combined$orig.ident
+  for (col in setdiff(colnames(sample_metadata_df), "sample")) {
+    combined[[col]] <- sample_metadata_df[[col]][match(combined$sample, sample_metadata_df$sample)]
+  }
+
+  # 5. Standard Seurat workflow
+  combined <- NormalizeData(combined)
+  combined <- FindVariableFeatures(combined, nfeatures = 3000)
+  combined <- ScaleData(combined, vars.to.regress = "percent.mito")
+  combined <- RunPCA(combined, npcs = 50)
+
+  # 6. Harmony batch correction
+  if (run_harmony) {
+    combined <- RunHarmony(combined, group.by.vars = "sample")
+    reduction_to_use <- "harmony"
+  } else {
+    reduction_to_use <- "pca"
+  }
+
+  # 7. UMAP and clustering
+  combined <- RunUMAP(combined, reduction = reduction_to_use, dims = 1:30)
+  combined <- FindNeighbors(combined, reduction = reduction_to_use, dims = 1:30)
+  combined <- FindClusters(combined, resolution = 0.3)
+
+  # 8. Save
+  qs::qsave(combined, output_file)
+
+  return(combined)
+}
+
+# Run pipeline
+obj <- process_project(
+  seurat_list = data_list,
+  sample_metadata_df = sample_info,
+  output_file = "proj23_harmony_processed.qsave"
+)
+```
+
+# Session Info
+
+```{r session_info}
+sessionInfo()
+```

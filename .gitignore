@@ -1,0 +1,20 @@
+# Large data files (not shared)
+*.qsave
+*.rds
+*.h5
+*.h5ad
+*.loom
+objects/
+
+# R artifacts
+.Rhistory
+.RData
+.Rproj.user/
+*.Rproj
+
+# macOS
+.DS_Store
+._*
+
+# Node modules (if any)
+node_modules/

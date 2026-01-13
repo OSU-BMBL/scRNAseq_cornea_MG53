@@ -1,0 +1,325 @@
+---
+title: "2. Cell Type Annotation and Composition Analysis"
+author: "Cankun Wang"
+date: "`r format(Sys.time(), '%m/%d/%Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    code_folding: show
+---
+
+# Overview
+
+This notebook applies cell type annotations (provided by collaborator Lilian Sakai) and generates composition analysis figures.
+
+**Cell Types (12 total)**:
+- Corneal epithelial cells, Corneal basal epithelial cells
+- Transient amplifying cells (TACs), Limbal stem cells (LSCs)
+- Conjunctival epithelial cells, Conjunctival basal epithelial cells
+- Keratocytes, Fibroblasts, Myofibroblasts
+- Endothelial cells, Schwann cells, Immune cells
+
+# Setup
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = TRUE, warning = TRUE, error = TRUE)
+```
+
+```{r load_packages}
+library(qs)
+library(Seurat)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(patchwork)
+library(RColorBrewer)
+library(scales)
+
+set.seed(42)
+```
+
+```{r setup_paths}
+# Output directories
+fig_dir <- "results/figures"
+tbl_dir <- "results/tables"
+obj_dir <- "objects"
+
+dir.create(fig_dir, showWarnings = FALSE, recursive = TRUE)
+dir.create(tbl_dir, showWarnings = FALSE, recursive = TRUE)
+dir.create(obj_dir, showWarnings = FALSE, recursive = TRUE)
+
+# Helper function
+save_plot <- function(p, filename, width = 10, height = 8, dpi = 300) {
+  fp_png <- file.path(fig_dir, paste0(filename, ".png"))
+  fp_svg <- file.path(fig_dir, paste0(filename, ".svg"))
+  ggsave(filename = fp_png, plot = p, width = width, height = height, dpi = dpi)
+  ggsave(filename = fp_svg, plot = p, width = width, height = height)
+  cat("  Saved:", fp_png, "\n")
+}
+```
+
+# Load Data
+
+```{r load_data, eval=FALSE}
+# Load preprocessed object
+obj <- qs::qread("proj23_harmony_processed.qsave")
+
+# Handle Seurat v5 layers
+if (inherits(obj[["RNA"]], "Assay5")) {
+  if (length(Layers(obj[["RNA"]])) > 1) {
+    obj[["RNA"]] <- JoinLayers(obj[["RNA"]])
+  }
+}
+
+cat("Cells:", ncol(obj), "\n")
+cat("Clusters:", length(unique(obj$seurat_clusters)), "\n")
+```
+
+# Sample Metadata
+
+```{r sample_metadata}
+# 2x2 Factorial Design: Genotype (MG53 KO/WT) x Injury Status
+sample_metadata <- data.frame(
+  sample = c("19072-23-01-01-01", "19072-23-02-01-01",
+             "19072-23-03-01-01", "19072-23-04-01-01"),
+  sample_label = c("C8", "C9", "C10", "C11"),
+  genotype = c("KO", "WT", "KO", "WT"),
+  injury = c("Injured", "Injured", "Uninjured", "Uninjured"),
+  condition = c("MG53 KO Injured", "MG53 WT Injured",
+                "MG53 KO Uninjured", "MG53 WT Uninjured")
+)
+
+knitr::kable(sample_metadata, caption = "Sample Information")
+```
+
+# Cell Type Annotation
+
+Mapping provided by Lilian Sakai (2024-12-12):
+
+```{r cluster_mapping}
+# Cluster to cell type mapping
+cluster_to_celltype <- c(
+  "0"  = "Corneal epithelial cells",
+  "1"  = "Transient amplifying cells (TACs)",
+  "2"  = "Corneal epithelial cells",
+  "3"  = "Corneal epithelial cells",
+  "4"  = "Corneal epithelial cells",
+  "5"  = "Corneal epithelial cells",
+  "6"  = "Immune cells",
+  "7"  = "Immune cells",
+  "8"  = "Limbal stem cells (LSCs)",
+  "9"  = "Corneal epithelial cells",
+  "10" = "Conjunctival basal epithelial cells",
+  "11" = "Conjunctival epithelial cells",
+  "12" = "Keratocytes",
+  "13" = "Corneal basal epithelial cells",
+  "14" = "Fibroblasts",
+  "15" = "Immune cells",
+  "16" = "Corneal basal epithelial cells",
+  "17" = "Transient amplifying cells (TACs)",
+  "18" = "Fibroblasts",
+  "19" = "Fibroblasts",
+  "20" = "Schwann cells",
+  "21" = "Myofibroblasts",
+  "22" = "Endothelial cells",
+  "23" = "Immune cells",
+  "24" = "Immune cells"
+)
+
+# Cell type order for plotting
+celltype_order <- c(
+  "Corneal epithelial cells",
+  "Corneal basal epithelial cells",
+  "Transient amplifying cells (TACs)",
+  "Limbal stem cells (LSCs)",
+  "Conjunctival epithelial cells",
+  "Conjunctival basal epithelial cells",
+  "Keratocytes",
+  "Fibroblasts",
+  "Myofibroblasts",
+  "Endothelial cells",
+  "Schwann cells",
+  "Immune cells"
+)
+
+# Display mapping table
+mapping_df <- data.frame(
+  Cluster = names(cluster_to_celltype),
+  CellType = cluster_to_celltype
+) %>% arrange(as.numeric(Cluster))
+
+knitr::kable(mapping_df, caption = "Cluster to Cell Type Mapping")
+```
+
+# Apply Annotations
+
+```{r apply_annotations, eval=FALSE}
+# Add experimental metadata
+obj$sample_label <- sample_metadata$sample_label[match(obj$sample, sample_metadata$sample)]
+obj$genotype <- factor(sample_metadata$genotype[match(obj$sample, sample_metadata$sample)],
+                       levels = c("WT", "KO"))
+obj$injury <- factor(sample_metadata$injury[match(obj$sample, sample_metadata$sample)],
+                     levels = c("Uninjured", "Injured"))
+obj$condition <- factor(sample_metadata$condition[match(obj$sample, sample_metadata$sample)],
+                        levels = c("MG53 WT Uninjured", "MG53 WT Injured",
+                                   "MG53 KO Uninjured", "MG53 KO Injured"))
+
+# Apply cell type annotations
+obj$celltype <- factor(cluster_to_celltype[as.character(obj$seurat_clusters)],
+                       levels = celltype_order)
+
+# Print cell counts
+table(obj$celltype)
+```
+
+# Color Palette
+
+```{r colors}
+# Publication-ready colors (12 cell types)
+celltype_colors <- c(
+  "Corneal epithelial cells" = "#E41A1C",
+  "Corneal basal epithelial cells" = "#FF7F00",
+  "Transient amplifying cells (TACs)" = "#FFFF33",
+  "Limbal stem cells (LSCs)" = "#4DAF4A",
+  "Conjunctival epithelial cells" = "#377EB8",
+  "Conjunctival basal epithelial cells" = "#984EA3",
+  "Keratocytes" = "#A65628",
+  "Fibroblasts" = "#F781BF",
+  "Myofibroblasts" = "#999999",
+  "Endothelial cells" = "#66C2A5",
+  "Schwann cells" = "#8DA0CB",
+  "Immune cells" = "#FC8D62"
+)
+
+condition_colors <- c(
+  "MG53 WT Uninjured" = "#4DAF4A",
+  "MG53 WT Injured" = "#E41A1C",
+  "MG53 KO Uninjured" = "#377EB8",
+  "MG53 KO Injured" = "#FF7F00"
+)
+```
+
+# UMAP Plots
+
+```{r umap_plots, eval=FALSE}
+# UMAP by cell type
+p_celltype <- DimPlot(obj, group.by = "celltype", label = TRUE,
+                      label.size = 3, repel = TRUE, pt.size = 0.3) +
+  scale_color_manual(values = celltype_colors) +
+  ggtitle("Cell Type Annotation") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+save_plot(p_celltype, "proj23_umap_celltype", width = 11, height = 8)
+
+# UMAP by condition
+p_condition <- DimPlot(obj, group.by = "condition", pt.size = 0.3) +
+  scale_color_manual(values = condition_colors) +
+  ggtitle("Experimental Conditions") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+save_plot(p_condition, "proj23_umap_condition", width = 10, height = 8)
+
+# Split by genotype
+p_genotype <- DimPlot(obj, group.by = "celltype", split.by = "genotype",
+                      label = FALSE, pt.size = 0.2) +
+  scale_color_manual(values = celltype_colors) +
+  ggtitle("Cell Types by Genotype (WT vs KO)")
+
+save_plot(p_genotype, "proj23_umap_split_genotype", width = 14, height = 7)
+
+# Split by injury
+p_injury <- DimPlot(obj, group.by = "celltype", split.by = "injury",
+                    label = FALSE, pt.size = 0.2) +
+  scale_color_manual(values = celltype_colors) +
+  ggtitle("Cell Types by Injury Status")
+
+save_plot(p_injury, "proj23_umap_split_injury", width = 14, height = 7)
+```
+
+# Marker Gene Expression
+
+```{r marker_genes}
+# Key markers for cell type validation
+marker_genes <- c(
+  # Epithelial
+  "Krt12", "Slurp1",     # Corneal epithelial
+  "Krt14", "Trp63",      # Basal epithelial
+  "Mki67", "Top2a",      # TACs (proliferation)
+  "Abcg2", "Gpha2",      # LSCs
+  "Krt13", "Krt4",       # Conjunctival
+  # Stromal
+  "Kera", "Lum",         # Keratocytes
+  "Thy1", "Col1a1",      # Fibroblasts
+  "Acta2", "Tagln",      # Myofibroblasts
+  # Other
+  "Pecam1", "Cldn5",     # Endothelial
+  "Plp1", "Mpz",         # Schwann
+  "Ptprc", "Cd68"        # Immune
+)
+```
+
+```{r dotplot, eval=FALSE}
+Idents(obj) <- "celltype"
+
+p_dot <- DotPlot(obj, features = marker_genes, cols = c("lightgrey", "darkred")) +
+  RotatedAxis() +
+  ggtitle("Marker Gene Expression by Cell Type") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+save_plot(p_dot, "proj23_dotplot_markers", width = 14, height = 6)
+```
+
+# Cell Type Composition
+
+```{r composition_analysis, eval=FALSE}
+# Calculate composition
+composition_df <- obj@meta.data %>%
+  count(condition, celltype) %>%
+  group_by(condition) %>%
+  mutate(percentage = n / sum(n) * 100) %>%
+  ungroup()
+
+# Stacked bar plot
+p_composition <- ggplot(composition_df, aes(x = condition, y = percentage, fill = celltype)) +
+  geom_bar(stat = "identity", width = 0.8) +
+  scale_fill_manual(values = celltype_colors) +
+  labs(title = "Cell Type Composition by Condition",
+       x = "", y = "Percentage (%)", fill = "Cell Type") +
+  theme_classic() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+
+save_plot(p_composition, "proj23_composition_by_condition", width = 10, height = 7)
+```
+
+# Save Results
+
+```{r save_results, eval=FALSE}
+# Cell type summary
+celltype_summary <- obj@meta.data %>%
+  count(celltype, name = "n_cells") %>%
+  mutate(percentage = round(n_cells / sum(n_cells) * 100, 2)) %>%
+  arrange(desc(n_cells))
+
+write.csv(celltype_summary, file.path(tbl_dir, "proj23_celltype_summary.csv"), row.names = FALSE)
+
+# Cell type by condition
+celltype_by_condition <- obj@meta.data %>%
+  count(condition, celltype) %>%
+  pivot_wider(names_from = condition, values_from = n, values_fill = 0)
+
+write.csv(celltype_by_condition, file.path(tbl_dir, "proj23_celltype_by_condition.csv"), row.names = FALSE)
+
+# Save annotated object
+qs::qsave(obj, file.path(obj_dir, "proj23_annotated.qsave"))
+```
+
+# Session Info
+
+```{r session_info}
+sessionInfo()
+```
