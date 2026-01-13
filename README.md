@@ -3,7 +3,6 @@
 Single-cell RNA sequencing analysis of mouse corneal tissue (Project 19072-23).
 
 **Collaboration**: Lilian Sakai (OSU Wexner Medical Center)
-**Interactive portal**: https://bmblx.bmi.osumc.edu/scrnaseq_huazhu_cornea/
 
 ## Experimental Design
 
